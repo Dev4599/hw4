@@ -149,6 +149,9 @@ def lookup(target_name: dns.name.Name,
             if not next_servers:
                 for ns_name in ns_names:
                     ns_response = lookup(ns_name, dns.rdatatype.A)
+                    if any(rrset.rdtype == dns.rdatatype.CNAME
+                           for rrset in ns_response.answer):
+                        continue
                     for rrset in ns_response.answer:
                         if rrset.rdtype == dns.rdatatype.A:
                             next_servers.extend(str(rr) for rr in rrset)

@@ -90,9 +90,36 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
+    servers = list(ROOT_SERVERS)
     outbound_query = dns.message.make_query(target_name, qtype)
-    response = dns.query.udp(outbound_query, "8.8.8.8", 3)
-    return response
+    while servers:
+        next_servers = []
+        for server in servers:
+            try:
+                response = dns.query.udp(outbound_query, server, 3)
+            except Exception:
+                continue
+            if response.answer:
+                for rrset in response.answer:
+                    if rrset.rdtype == dns.rdatatype.CNAME and qtype != dns.rdatatype.CNAME:
+                        return lookup(rrset[0].target, qtype)
+                return response
+            ns_names = [rr.target for rrset in response.authority
+                        if rrset.rdtype == dns.rdatatype.NS for rr in rrset]
+            if not ns_names:
+                continue
+            for rrset in response.additional:
+                if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names:
+                    next_servers.extend(str(rr) for rr in rrset)
+            if not next_servers:
+                for ns_name in ns_names:
+                    ns_response = lookup(ns_name, dns.rdatatype.A)
+                    for rrset in ns_response.answer:
+                        if rrset.rdtype == dns.rdatatype.A:
+                            next_servers.extend(str(rr) for rr in rrset)
+            break
+        servers = next_servers
+    return dns.message.make_response(outbound_query)
 
 
 def print_results(results: dict) -> None:

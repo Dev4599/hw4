@@ -30,6 +30,23 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
+ANSWER_CACHE = {}
+ZONE_CACHE = {}
+
+
+def _start_servers(target_name: dns.name.Name) -> list:
+    """
+    Find the best longest known zone covering target_name, falling back
+    to the root servers when nothing closer is cached.
+    """
+    name = target_name
+    while True:
+        if name in ZONE_CACHE:
+            return list(ZONE_CACHE[name])
+        if name == dns.name.root:
+            return list(ROOT_SERVERS)
+        name = name.parent()
+
 
 def collect_results(name: str) -> dict:
     """
@@ -90,25 +107,37 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
-    servers = list(ROOT_SERVERS)
+    cache_key = (target_name, qtype)
+    if cache_key in ANSWER_CACHE:
+        return ANSWER_CACHE[cache_key]
+    servers = _start_servers(target_name)
     outbound_query = dns.message.make_query(target_name, qtype)
+    response = dns.message.make_response(outbound_query)
     while servers:
         next_servers = []
+        answered = False
         for server in servers:
             try:
-                response = dns.query.udp(outbound_query, server, 3)
+                server_response = dns.query.udp(outbound_query, server, 3)
             except Exception:
                 continue
-            if response.answer:
+            if server_response.answer:
+                response = server_response
                 for rrset in response.answer:
                     if rrset.rdtype == dns.rdatatype.CNAME and qtype != dns.rdatatype.CNAME:
-                        return lookup(rrset[0].target, qtype)
-                return response
-            ns_names = [rr.target for rrset in response.authority
-                        if rrset.rdtype == dns.rdatatype.NS for rr in rrset]
+                        response = lookup(rrset[0].target, qtype)
+                        break
+                answered = True
+                break
+            zone_name = None
+            ns_names = []
+            for rrset in server_response.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    zone_name = rrset.name
+                    ns_names.extend(rr.target for rr in rrset)
             if not ns_names:
                 continue
-            for rrset in response.additional:
+            for rrset in server_response.additional:
                 if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names:
                     next_servers.extend(str(rr) for rr in rrset)
             if not next_servers:
@@ -117,9 +146,14 @@ def lookup(target_name: dns.name.Name,
                     for rrset in ns_response.answer:
                         if rrset.rdtype == dns.rdatatype.A:
                             next_servers.extend(str(rr) for rr in rrset)
+            if next_servers and zone_name is not None:
+                ZONE_CACHE[zone_name] = next_servers
+            break
+        if answered:
             break
         servers = next_servers
-    return dns.message.make_response(outbound_query)
+    ANSWER_CACHE[cache_key] = response
+    return response
 
 
 def print_results(results: dict) -> None:

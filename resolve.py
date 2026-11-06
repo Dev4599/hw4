@@ -41,7 +41,7 @@ def _start_servers(target_name: dns.name.Name) -> list:
     """
     name = target_name
     while True:
-        if name in ZONE_CACHE:
+        if name in ZONE_CACHE and ZONE_CACHE[name]:
             return list(ZONE_CACHE[name])
         if name == dns.name.root:
             return list(ROOT_SERVERS)
@@ -110,60 +110,70 @@ def lookup(target_name: dns.name.Name,
     cache_key = (target_name, qtype)
     if cache_key in ANSWER_CACHE:
         return ANSWER_CACHE[cache_key]
-    servers = _start_servers(target_name)
-    outbound_query = dns.message.make_query(target_name, qtype)
-    response = dns.message.make_response(outbound_query)
-    while servers:
-        next_servers = []
-        answered = False
-        for server in servers:
-            try:
-                server_response = dns.query.udp(outbound_query, server, 3)
-            except Exception:
-                continue
-            if server_response.answer:
-                cname_rrset = None
-                for rrset in server_response.answer:
-                    if rrset.rdtype == dns.rdatatype.CNAME:
-                        cname_rrset = rrset
-                        break
-                if cname_rrset is not None:
-                    chained = lookup(cname_rrset[0].target, qtype)
-                    response = dns.message.make_response(outbound_query)
-                    response.answer = [cname_rrset] + list(chained.answer)
-                else:
-                    response = server_response
-                answered = True
-                break
-            zone_name = None
-            ns_names = []
-            for rrset in server_response.authority:
-                if rrset.rdtype == dns.rdatatype.NS:
-                    zone_name = rrset.name
-                    ns_names.extend(rr.target for rr in rrset)
-            if not ns_names:
-                continue
-            for rrset in server_response.additional:
-                if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names:
-                    next_servers.extend(str(rr) for rr in rrset)
-            if not next_servers:
-                for ns_name in ns_names:
-                    ns_response = lookup(ns_name, dns.rdatatype.A)
-                    if any(rrset.rdtype == dns.rdatatype.CNAME
-                           for rrset in ns_response.answer):
-                        continue
-                    for rrset in ns_response.answer:
-                        if rrset.rdtype == dns.rdatatype.A:
-                            next_servers.extend(str(rr) for rr in rrset)
-            if next_servers and zone_name is not None:
-                ZONE_CACHE[zone_name] = next_servers
-            break
-        if answered:
-            break
-        servers = next_servers
-    ANSWER_CACHE[cache_key] = response
-    return response
 
+    # Guards against endless recursion when resolving glueless nameservers
+    pending = lookup.__dict__.setdefault("pending", set())
+    if cache_key in pending:
+        return dns.message.make_response(dns.message.make_query(target_name, qtype))
+    pending.add(cache_key)
+
+    try:
+        outbound_query = dns.message.make_query(target_name, qtype)
+        response = dns.message.make_response(outbound_query)
+        servers = _start_servers(target_name)
+        visited = set()
+        got_answer = False
+
+        while servers and not got_answer:
+            next_servers = []
+            for server in servers:
+                if server in visited:
+                    continue
+                visited.add(server)
+                try:
+                    server_response = dns.query.udp(outbound_query, server, 3)
+                except Exception:
+                    continue
+
+                if server_response.answer:
+                    cnames = [r for r in server_response.answer
+                              if r.rdtype == dns.rdatatype.CNAME]
+                    if cnames:
+                        chained = lookup(cnames[0][0].target, qtype)
+                        response = dns.message.make_response(outbound_query)
+                        response.answer = cnames + list(chained.answer)
+                    else:
+                        response = server_response
+                    got_answer = True
+                    break
+
+                ns_names = [rr.target for rrset in server_response.authority
+                            if rrset.rdtype == dns.rdatatype.NS for rr in rrset]
+                zone_names = [rrset.name for rrset in server_response.authority
+                              if rrset.rdtype == dns.rdatatype.NS]
+                if not ns_names or not zone_names or not target_name.is_subdomain(zone_names[-1]):
+                    continue
+                zone_name = zone_names[-1]
+
+                glue = [str(rr) for rrset in server_response.additional
+                        if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names
+                        for rr in rrset]
+                if glue:
+                    ZONE_CACHE[zone_name] = glue
+                    next_servers.extend(glue)
+                else:
+                    for ns_name in ns_names:
+                        ns_response = lookup(ns_name, dns.rdatatype.A)
+                        next_servers.extend(str(rr) for rrset in ns_response.answer
+                                            if rrset.rdtype == dns.rdatatype.A for rr in rrset)
+
+            servers = next_servers
+
+        if got_answer:
+            ANSWER_CACHE[cache_key] = response
+        return response
+    finally:
+        pending.discard(cache_key)
 
 def print_results(results: dict) -> None:
     """

@@ -122,11 +122,17 @@ def lookup(target_name: dns.name.Name,
             except Exception:
                 continue
             if server_response.answer:
-                response = server_response
-                for rrset in response.answer:
-                    if rrset.rdtype == dns.rdatatype.CNAME and qtype != dns.rdatatype.CNAME:
-                        response = lookup(rrset[0].target, qtype)
+                cname_rrset = None
+                for rrset in server_response.answer:
+                    if rrset.rdtype == dns.rdatatype.CNAME:
+                        cname_rrset = rrset
                         break
+                if cname_rrset is not None:
+                    chained = lookup(cname_rrset[0].target, qtype)
+                    response = dns.message.make_response(outbound_query)
+                    response.answer = [cname_rrset] + list(chained.answer)
+                else:
+                    response = server_response
                 answered = True
                 break
             zone_name = None
